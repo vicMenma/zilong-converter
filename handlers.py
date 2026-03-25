@@ -92,6 +92,8 @@ def register_handlers(app: Client):
         filters.text & ~filters.command(["start", "cancel"])
     )
     async def on_text(client: Client, msg: Message):
+        if not msg.from_user:
+            return  # channel post / anonymous — ignore
         uid  = msg.from_user.id
         s    = get_session(uid)
         text = msg.text.strip()
@@ -162,6 +164,8 @@ def register_handlers(app: Client):
     # ══════════════════════════════════════════════════════════════════════════
     @app.on_message(filters.document | filters.video)
     async def on_file(client: Client, msg: Message):
+        if not msg.from_user:
+            return  # channel post / anonymous — ignore
         uid   = msg.from_user.id
         s     = get_session(uid)
 
@@ -297,6 +301,8 @@ def register_handlers(app: Client):
     # ══════════════════════════════════════════════════════════════════════════
     @app.on_callback_query()
     async def on_cb(client: Client, cb: CallbackQuery):
+        if not cb.from_user:
+            return
         uid  = cb.from_user.id
         s    = get_session(uid)
         data = cb.data
@@ -437,8 +443,9 @@ def register_handlers(app: Client):
         out_ext  = ".mkv" if sub_type == "sub:mux" else ".mp4"
         out_path = os.path.join(work, f"output{out_ext}")
         t_start  = datetime.now()
+        duration = s.duration or 0
 
-        mode_label = "🔥 Burning subtitles" if sub_type == "sub:burn" else "📦 Embedding subtitles"
+        mode_label = "🔥 <b>BURNING SUBTITLES</b>" if sub_type == "sub:burn" else "📦 <b>EMBEDDING SUBTITLES</b>"
         header = (
             f"{mode_label}\n"
             "──────────────────\n"
@@ -450,17 +457,36 @@ def register_handlers(app: Client):
             reply_markup=KB_CANCEL,
         )
 
+        def _ffmpeg_cb(status_msg, hdr):
+            async def cb(pct, fps, speed, size, bitrate, eta, elapsed):
+                await status_bar(
+                    msg=status_msg, header=hdr, pct=pct,
+                    speed=f"{speed}  ({bitrate})", eta=eta,
+                    done=size, total="—",
+                    engine=f"FFmpeg ⚙️  {fps:.0f}fps", elapsed=elapsed,
+                )
+            return cb
+
+        ffmpeg_cb = _ffmpeg_cb(status, header)
+
         try:
             if sub_type == "sub:mux":
-                result = await mux_subtitles(s.video_path, s.sub_path, out_path)
+                result = await mux_subtitles(
+                    s.video_path, s.sub_path, out_path,
+                    progress_cb=ffmpeg_cb, duration=duration,
+                )
             else:
                 if scale_res:
                     result = await burn_sub_and_compress(
                         s.video_path, s.sub_path, out_path,
                         res_label=scale_res,
+                        progress_cb=ffmpeg_cb, duration=duration,
                     )
                 else:
-                    result = await burn_subtitles(s.video_path, s.sub_path, out_path)
+                    result = await burn_subtitles(
+                        s.video_path, s.sub_path, out_path,
+                        progress_cb=ffmpeg_cb, duration=duration,
+                    )
 
             elapsed = _fmt_time((datetime.now() - t_start).total_seconds())
             await status.edit_text(
@@ -508,11 +534,30 @@ def register_handlers(app: Client):
             reply_markup=KB_CANCEL,
         )
 
+        def _ffmpeg_cb2(status_msg, hdr):
+            async def cb(pct, fps, speed, size, bitrate, eta, elapsed):
+                await status_bar(
+                    msg=status_msg, header=hdr, pct=pct,
+                    speed=f"{speed}  ({bitrate})", eta=eta,
+                    done=size, total="—",
+                    engine=f"FFmpeg ⚙️  {fps:.0f}fps", elapsed=elapsed,
+                )
+            return cb
+
+        ffmpeg_cb = _ffmpeg_cb2(status, header)
+        duration  = get_session(uid).duration or 0
+
         try:
             if s.comp_mode == "resolution":
-                result = await compress_to_res(s.video_path, res, out_path)
+                result = await compress_to_res(
+                    s.video_path, res, out_path,
+                    progress_cb=ffmpeg_cb, duration=duration,
+                )
             else:
-                result = await compress_to_size(s.video_path, mb, out_path)
+                result = await compress_to_size(
+                    s.video_path, mb, out_path,
+                    progress_cb=ffmpeg_cb, duration=duration,
+                )
 
             elapsed = _fmt_time((datetime.now() - t_start).total_seconds())
             await status.edit_text(
@@ -554,11 +599,24 @@ def register_handlers(app: Client):
             reply_markup=KB_CANCEL,
         )
 
+        def _ffmpeg_cb3(status_msg, hdr):
+            async def cb(pct, fps, speed, size, bitrate, eta, elapsed):
+                await status_bar(
+                    msg=status_msg, header=hdr, pct=pct,
+                    speed=f"{speed}  ({bitrate})", eta=eta,
+                    done=size, total="—",
+                    engine=f"FFmpeg ⚙️  {fps:.0f}fps", elapsed=elapsed,
+                )
+            return cb
+
+        ffmpeg_cb = _ffmpeg_cb3(status, header)
+        duration  = get_session(uid).duration or 0
+
         try:
             result = await burn_sub_and_compress(
                 s.video_path, s.sub_path, out_path,
-                res_label=res_label,
-                target_mb=target_mb,
+                res_label=res_label, target_mb=target_mb,
+                progress_cb=ffmpeg_cb, duration=duration,
             )
             elapsed = _fmt_time((datetime.now() - t_start).total_seconds())
             await status.edit_text(

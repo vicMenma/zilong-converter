@@ -1,14 +1,5 @@
 """
-ffmpeg_ops.py — All FFmpeg wrappers for the converter bot.
-
-Operations:
-  probe_video()       → duration, resolution, has_audio
-  convert_subtitle()  → .vtt / .txt → .srt (normalise to SRT before burn)
-  burn_subtitles()    → hard-code subs into video stream
-  mux_subtitles()     → embed as soft subtitle track (mkv/mp4)
-  compress_to_size()  → 2-pass encode targeting a file size (MB)
-  compress_to_res()   → scale + CRF encode to target resolution
-  compress_to_res_and_size() → scale first, then 2-pass to hit MB target
+ffmpeg_ops.py — All FFmpeg wrappers with live progress callbacks.
 """
 
 import asyncio
@@ -16,23 +7,122 @@ import os
 import re
 import shutil
 import json
+import time
 from pathlib import Path
 
-# ── Helper: run subprocess ─────────────────────────────────────────────────────
+
+# ── FFmpeg progress line parser ────────────────────────────────────────────────
+_FFMPEG_RE = re.compile(
+    r"frame=\s*(\d+).*?fps=\s*([\d.]+).*?size=\s*([\d.]+\w+).*?"
+    r"time=([\d:\.]+).*?bitrate=\s*([\S]+).*?speed=\s*([\S]+)"
+)
+
+def _parse_ffmpeg(line: str) -> dict | None:
+    m = _FFMPEG_RE.search(line)
+    if not m:
+        return None
+    return {
+        "frame":   int(m.group(1)),
+        "fps":     float(m.group(2) or 0),
+        "size":    m.group(3),
+        "time":    m.group(4),
+        "bitrate": m.group(5),
+        "speed":   m.group(6),
+    }
+
+def _ts_to_s(ts: str) -> float:
+    try:
+        p = ts.split(":")
+        return int(p[0]) * 3600 + int(p[1]) * 60 + float(p[2])
+    except Exception:
+        return 0.0
+
+def _fmt(secs: float) -> str:
+    s = int(secs)
+    h, r = divmod(s, 3600); m, s2 = divmod(r, 60)
+    return (f"{h}h {m}m {s2}s" if h else f"{m}m {s2}s" if m else f"{s2}s")
+
+
+# ── Silent runner (ffprobe, pass-1) ───────────────────────────────────────────
 async def _run(cmd: list[str], cwd: str = None) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=cwd
+        cwd=cwd,
     )
     stdout, stderr = await proc.communicate()
     return proc.returncode, stdout.decode(), stderr.decode()
 
 
+# ── Live-progress runner ───────────────────────────────────────────────────────
+async def _run_progress(
+    cmd: list[str],
+    duration: float,
+    progress_cb=None,
+    cwd: str = None,
+) -> tuple[int, str]:
+    """
+    Streams FFmpeg stderr line by line.
+    Calls progress_cb(pct, fps, speed, size, bitrate, eta, elapsed) every ~3s.
+    Returns (returncode, full_stderr).
+    """
+    # inject -stats_period 2 for more frequent updates (FFmpeg >= 4.4)
+    try:
+        idx = cmd.index("ffmpeg") + 1
+    except ValueError:
+        idx = 1
+    cmd = cmd[:idx] + ["-stats_period", "2"] + cmd[idx:]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,  # merge so we catch everything
+        cwd=cwd,
+    )
+
+    buf       = []
+    last_cb   = 0.0
+    t_start   = time.time()
+
+    async for raw in proc.stdout:
+        line = raw.decode(errors="replace").strip()
+        if line:
+            buf.append(line)
+
+        if progress_cb and duration > 0:
+            parsed = _parse_ffmpeg(line)
+            if parsed:
+                now = time.time()
+                if now - last_cb >= 3.0:
+                    last_cb  = now
+                    elapsed  = now - t_start
+                    done_s   = _ts_to_s(parsed["time"])
+                    pct      = min(done_s / duration * 100, 99.0)
+                    try:
+                        speed_x = float(parsed["speed"].rstrip("x") or 0)
+                    except Exception:
+                        speed_x = 0
+                    remaining = (duration - done_s) / speed_x if speed_x > 0 else 0
+                    try:
+                        await progress_cb(
+                            pct     = pct,
+                            fps     = parsed["fps"],
+                            speed   = parsed["speed"],
+                            size    = parsed["size"],
+                            bitrate = parsed["bitrate"],
+                            eta     = _fmt(remaining),
+                            elapsed = _fmt(elapsed),
+                        )
+                    except Exception:
+                        pass
+
+    await proc.wait()
+    return proc.returncode, "\n".join(buf)
+
+
 # ── Probe ──────────────────────────────────────────────────────────────────────
 async def probe_video(path: str) -> dict:
-    """Returns dict: duration(s), width, height, has_audio, size_bytes"""
     rc, out, _ = await _run([
         "ffprobe", "-v", "quiet",
         "-print_format", "json",
@@ -41,8 +131,8 @@ async def probe_video(path: str) -> dict:
     ])
     if rc != 0:
         raise RuntimeError("ffprobe failed — is the file a valid video?")
-    data = json.loads(out)
-    duration = float(data["format"].get("duration", 0))
+    data       = json.loads(out)
+    duration   = float(data["format"].get("duration", 0))
     size_bytes = int(data["format"].get("size", 0))
     width = height = 0
     has_audio = False
@@ -52,181 +142,127 @@ async def probe_video(path: str) -> dict:
             height = s.get("height", 0)
         if s.get("codec_type") == "audio":
             has_audio = True
-    return {
-        "duration":   duration,
-        "width":      width,
-        "height":     height,
-        "has_audio":  has_audio,
-        "size_bytes": size_bytes,
-    }
+    return {"duration": duration, "width": width, "height": height,
+            "has_audio": has_audio, "size_bytes": size_bytes}
 
 
 # ── Subtitle normalisation ─────────────────────────────────────────────────────
 def _vtt_to_srt(content: str) -> str:
-    """Basic WebVTT → SRT conversion."""
     lines = content.splitlines()
-    out, idx = [], 1
-    i = 0
+    out, idx, i = [], 1, 0
     while i < len(lines):
         line = lines[i].strip()
-        # skip WEBVTT header / NOTE / STYLE blocks
-        if line.startswith("WEBVTT") or line.startswith("NOTE") or line.startswith("STYLE"):
-            i += 1
-            continue
-        # timestamp line
+        if line.startswith(("WEBVTT", "NOTE", "STYLE")):
+            i += 1; continue
         if "-->" in line:
-            ts = line.replace(".", ",")   # VTT uses dots, SRT uses commas
-            # remove cue settings after timestamp
-            ts = re.sub(r"\s+(align|position|size|line|vertical):\S+", "", ts)
-            out.append(str(idx))
-            out.append(ts)
-            idx += 1
-            i += 1
+            ts = re.sub(r"\s+(align|position|size|line|vertical):\S+", "", line.replace(".", ","))
+            out += [str(idx), ts]; idx += 1; i += 1
             block = []
             while i < len(lines) and lines[i].strip():
-                block.append(lines[i])
-                i += 1
-            out.extend(block)
-            out.append("")
+                block.append(lines[i]); i += 1
+            out += block + [""]
         else:
             i += 1
     return "\n".join(out)
 
-
 def _txt_to_srt(content: str) -> str:
-    """
-    Plain TXT: assume each non-empty line is dialogue.
-    Creates 3-second subtitles one after another.
-    """
     lines = [l.strip() for l in content.splitlines() if l.strip()]
     out = []
     for idx, line in enumerate(lines, 1):
-        start_s = (idx - 1) * 3
-        end_s   = idx * 3
-        def ts(s):
-            h, rem = divmod(s, 3600)
-            m, s2  = divmod(rem, 60)
-            return f"{h:02}:{m:02}:{s2:02},000"
-        out.append(str(idx))
-        out.append(f"{ts(start_s)} --> {ts(end_s)}")
-        out.append(line)
-        out.append("")
+        s, e = (idx-1)*3, idx*3
+        def ts(x): h,r=divmod(x,3600); m,s2=divmod(r,60); return f"{h:02}:{m:02}:{s2:02},000"
+        out += [str(idx), f"{ts(s)} --> {ts(e)}", line, ""]
     return "\n".join(out)
 
-
 def normalise_subtitle(src_path: str, work_dir: str) -> str:
-    """
-    Convert .vtt / .txt → .srt in work_dir.
-    .srt and .ass pass through unchanged (copy to work_dir).
-    Returns path to the normalised file.
-    """
-    ext = Path(src_path).suffix.lower()
-    base = Path(src_path).stem
+    ext     = Path(src_path).suffix.lower()
+    base    = Path(src_path).stem
     content = Path(src_path).read_text(encoding="utf-8", errors="replace")
-
     if ext in (".srt", ".ass", ".ssa"):
         dst = os.path.join(work_dir, Path(src_path).name)
-        shutil.copy2(src_path, dst)
-        return dst
-
+        shutil.copy2(src_path, dst); return dst
     if ext == ".vtt":
-        srt_content = _vtt_to_srt(content)
         dst = os.path.join(work_dir, base + ".srt")
-        Path(dst).write_text(srt_content, encoding="utf-8")
-        return dst
-
+        Path(dst).write_text(_vtt_to_srt(content), encoding="utf-8"); return dst
     if ext == ".txt":
-        srt_content = _txt_to_srt(content)
         dst = os.path.join(work_dir, base + ".srt")
-        Path(dst).write_text(srt_content, encoding="utf-8")
-        return dst
-
+        Path(dst).write_text(_txt_to_srt(content), encoding="utf-8"); return dst
     raise ValueError(f"Unsupported subtitle format: {ext}")
 
 
-# ── Subtitle burn-in (HARD) ────────────────────────────────────────────────────
+# ── Resolution map ─────────────────────────────────────────────────────────────
+RESOLUTION_MAP = {
+    "4K":    2160,
+    "1080p": 1080,
+    "720p":  720,
+    "480p":  480,
+    "360p":  360,
+    "240p":  240,
+}
+
+
+# ── Burn-in subtitles (HARD) ───────────────────────────────────────────────────
 async def burn_subtitles(
-    video_path: str,
-    sub_path:   str,
+    video_path:  str,
+    sub_path:    str,
     output_path: str,
     progress_cb=None,
-    extra_vf:   str = None,   # e.g. "scale=-2:720" to combine with sub burn
+    extra_vf:    str = None,
+    duration:    float = 0,
 ) -> str:
-    """
-    Hard-code subtitles into the video using the subtitles/ass filter.
-    ASS/SSA → uses `ass=` filter (preserves all styling).
-    SRT/other → uses `subtitles=` filter (basic style).
-    """
-    ext = Path(sub_path).suffix.lower()
-    # FFmpeg subtitle filter paths must have colons escaped on Windows; fine on Linux
+    ext      = Path(sub_path).suffix.lower()
     safe_sub = sub_path.replace("\\", "/").replace(":", "\\:")
-
-    if ext in (".ass", ".ssa"):
-        sub_filter = f"ass={safe_sub}"
-    else:
-        sub_filter = f"subtitles={safe_sub}"
-
-    vf = sub_filter if not extra_vf else f"{extra_vf},{sub_filter}"
-
+    sub_f    = f"ass={safe_sub}" if ext in (".ass", ".ssa") else f"subtitles={safe_sub}"
+    vf       = sub_f if not extra_vf else f"{extra_vf},{sub_f}"
     cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
+        "ffmpeg", "-y", "-i", video_path,
         "-vf", vf,
         "-c:v", "libx264", "-crf", "18", "-preset", "medium",
-        "-c:a", "copy",
-        output_path
+        "-c:a", "copy", output_path
     ]
-    rc, _, err = await _run(cmd)
+    rc, err = await _run_progress(cmd, duration, progress_cb)
     if rc != 0:
         raise RuntimeError(f"Subtitle burn failed:\n{err[-800:]}")
     return output_path
 
 
-# ── Subtitle soft-mux (SOFT) ───────────────────────────────────────────────────
+# ── Soft-mux subtitles (embed track, no re-encode) ────────────────────────────
 async def mux_subtitles(
     video_path:  str,
     sub_path:    str,
     output_path: str,
+    progress_cb=None,
+    duration:    float = 0,
 ) -> str:
-    """
-    Embed subtitle as a selectable stream (no re-encode of video/audio).
-    Output should be .mkv for universal sub codec support.
-    """
-    out = output_path if output_path.endswith(".mkv") else output_path.replace(".mp4", ".mkv")
-    ext = Path(sub_path).suffix.lower()
+    out       = output_path if output_path.endswith(".mkv") else output_path.replace(".mp4", ".mkv")
+    ext       = Path(sub_path).suffix.lower()
     sub_codec = "ass" if ext in (".ass", ".ssa") else "srt"
-
     cmd = [
         "ffmpeg", "-y",
-        "-i", video_path,
-        "-i", sub_path,
-        "-c:v", "copy",
-        "-c:a", "copy",
-        "-c:s", sub_codec,
-        "-map", "0:v",
-        "-map", "0:a?",
-        "-map", "1:s",
+        "-i", video_path, "-i", sub_path,
+        "-c:v", "copy", "-c:a", "copy", "-c:s", sub_codec,
+        "-map", "0:v", "-map", "0:a?", "-map", "1:s",
         out
     ]
-    rc, _, err = await _run(cmd)
+    rc, err = await _run_progress(cmd, duration, progress_cb)
     if rc != 0:
         raise RuntimeError(f"Subtitle mux failed:\n{err[-800:]}")
     return out
 
 
-# ── Compress: target file size (2-pass CBR) ────────────────────────────────────
+# ── 2-pass CBR: target file size ──────────────────────────────────────────────
 async def compress_to_size(
     video_path:   str,
     target_mb:    float,
     output_path:  str,
     audio_kbps:   int = 128,
-    scale_height: int = None,   # optional: also scale resolution
+    scale_height: int = None,
+    progress_cb=None,
+    duration:     float = 0,
 ) -> str:
-    """
-    2-pass H.264 encode to hit ~target_mb file size.
-    """
-    info = await probe_video(video_path)
-    duration = info["duration"]
+    if not duration:
+        info = await probe_video(video_path)
+        duration = info["duration"]
     if duration <= 0:
         raise ValueError("Could not read video duration.")
 
@@ -237,37 +273,31 @@ async def compress_to_size(
         raise ValueError(f"Target size too small for {duration:.0f}s of audio alone.")
     video_kbps = int(video_bits / duration / 1000)
 
-    vf_args = []
-    if scale_height:
-        vf_args = ["-vf", f"scale=-2:{scale_height}"]
-
+    vf_args  = ["-vf", f"scale=-2:{scale_height}"] if scale_height else []
     work_dir = os.path.dirname(output_path)
 
-    # Pass 1
+    # Pass 1 (silent — no useful progress output)
     pass1 = [
-        "ffmpeg", "-y", "-i", video_path,
-        *vf_args,
+        "ffmpeg", "-y", "-i", video_path, *vf_args,
         "-c:v", "libx264", "-b:v", f"{video_kbps}k",
         "-pass", "1", "-an", "-f", "null", "/dev/null"
     ]
-    rc, _, err = await _run(pass1, cwd=work_dir)
+    rc, err = await _run_progress(pass1, duration, None, cwd=work_dir)
     if rc != 0:
         raise RuntimeError(f"2-pass (pass 1) failed:\n{err[-800:]}")
 
-    # Pass 2
+    # Pass 2 (with live progress)
     pass2 = [
-        "ffmpeg", "-y", "-i", video_path,
-        *vf_args,
+        "ffmpeg", "-y", "-i", video_path, *vf_args,
         "-c:v", "libx264", "-b:v", f"{video_kbps}k",
         "-pass", "2",
         "-c:a", "aac", "-b:a", f"{audio_kbps}k",
         output_path
     ]
-    rc, _, err = await _run(pass2, cwd=work_dir)
+    rc, err = await _run_progress(pass2, duration, progress_cb, cwd=work_dir)
     if rc != 0:
         raise RuntimeError(f"2-pass (pass 2) failed:\n{err[-800:]}")
 
-    # Clean up 2-pass log files
     for f in ["ffmpeg2pass-0.log", "ffmpeg2pass-0.log.mbtree"]:
         try: os.remove(os.path.join(work_dir, f))
         except: pass
@@ -275,92 +305,82 @@ async def compress_to_size(
     return output_path
 
 
-# ── Compress: target resolution (CRF) ─────────────────────────────────────────
-RESOLUTION_MAP = {
-    "4K":   2160,
-    "1080p": 1080,
-    "720p":  720,
-    "480p":  480,
-    "360p":  360,
-    "240p":  240,
-}
-
+# ── CRF + scale: target resolution ────────────────────────────────────────────
 async def compress_to_res(
     video_path:  str,
-    res_label:   str,   # "1080p", "720p", etc.
+    res_label:   str,
     output_path: str,
     crf:         int = 23,
     preset:      str = "medium",
+    progress_cb=None,
+    duration:    float = 0,
 ) -> str:
-    """
-    Scale to target resolution + CRF encode. Fast single-pass.
-    """
     height = RESOLUTION_MAP.get(res_label)
     if not height:
         raise ValueError(f"Unknown resolution: {res_label}. Use one of {list(RESOLUTION_MAP)}")
-
     cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
+        "ffmpeg", "-y", "-i", video_path,
         "-vf", f"scale=-2:{height}",
         "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
-        "-c:a", "copy",
-        output_path
+        "-c:a", "copy", output_path
     ]
-    rc, _, err = await _run(cmd)
+    rc, err = await _run_progress(cmd, duration, progress_cb)
     if rc != 0:
         raise RuntimeError(f"Resolution compress failed:\n{err[-800:]}")
     return output_path
 
 
-# ── Combined: subtitle burn + compress ────────────────────────────────────────
+# ── Combined: burn subs + compress ────────────────────────────────────────────
 async def burn_sub_and_compress(
     video_path:   str,
     sub_path:     str,
     output_path:  str,
-    res_label:    str = None,   # optional resolution target
-    target_mb:    float = None, # optional size target (2-pass after burn)
+    res_label:    str = None,
+    target_mb:    float = None,
     crf:          int = 23,
+    progress_cb=None,
+    duration:     float = 0,
 ) -> str:
-    """
-    If only resolution or CRF: single-pass with combined vf filter.
-    If target_mb: two-stage (burn first → then 2-pass compress).
-    """
-    ext = Path(sub_path).suffix.lower()
+    ext      = Path(sub_path).suffix.lower()
     safe_sub = sub_path.replace("\\", "/").replace(":", "\\:")
-    sub_filter = f"ass={safe_sub}" if ext in (".ass", ".ssa") else f"subtitles={safe_sub}"
-
-    scale_height = RESOLUTION_MAP.get(res_label) if res_label else None
+    sub_f    = f"ass={safe_sub}" if ext in (".ass", ".ssa") else f"subtitles={safe_sub}"
+    scale_h  = RESOLUTION_MAP.get(res_label) if res_label else None
 
     if target_mb:
-        # Stage 1: burn subs (with optional scale) → temp file
         tmp = output_path + ".burned.mp4"
-        vf = f"scale=-2:{scale_height},{sub_filter}" if scale_height else sub_filter
+        vf  = f"scale=-2:{scale_h},{sub_f}" if scale_h else sub_f
+
+        async def cb_burn(**kw):
+            if progress_cb:
+                await progress_cb(pct=kw["pct"] / 2,
+                                  **{k: v for k, v in kw.items() if k != "pct"})
+
         cmd = [
-            "ffmpeg", "-y", "-i", video_path,
-            "-vf", vf,
+            "ffmpeg", "-y", "-i", video_path, "-vf", vf,
             "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
-            "-c:a", "copy",
-            tmp
+            "-c:a", "copy", tmp
         ]
-        rc, _, err = await _run(cmd)
+        rc, err = await _run_progress(cmd, duration, cb_burn)
         if rc != 0:
             raise RuntimeError(f"Sub burn stage failed:\n{err[-800:]}")
-        # Stage 2: 2-pass to hit size
-        result = await compress_to_size(tmp, target_mb, output_path)
+
+        async def cb_compress(**kw):
+            if progress_cb:
+                await progress_cb(pct=50 + kw["pct"] / 2,
+                                  **{k: v for k, v in kw.items() if k != "pct"})
+
+        result = await compress_to_size(tmp, target_mb, output_path,
+                                        progress_cb=cb_compress, duration=duration)
         os.remove(tmp)
         return result
     else:
-        # Single pass
-        vf = f"scale=-2:{scale_height},{sub_filter}" if scale_height else sub_filter
+        vf = f"scale=-2:{scale_h},{sub_f}" if scale_h else sub_f
         cmd = [
-            "ffmpeg", "-y", "-i", video_path,
-            "-vf", vf,
+            "ffmpeg", "-y", "-i", video_path, "-vf", vf,
             "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
-            "-c:a", "copy",
-            output_path
+            "-c:a", "copy", output_path
         ]
-        rc, _, err = await _run(cmd)
+        rc, err = await _run_progress(cmd, duration, progress_cb)
         if rc != 0:
             raise RuntimeError(f"Combined encode failed:\n{err[-800:]}")
         return output_path
