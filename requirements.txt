@@ -1,3 +1,4 @@
 pyrofork==2.3.42
 TgCrypto
 yt-dlp
+psutil

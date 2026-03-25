@@ -1,6 +1,5 @@
 """
 bot.py — Entry point for Zilong Converter Bot.
-Run: python bot.py
 """
 
 from pyrogram import Client
@@ -17,5 +16,5 @@ app = Client(
 register_handlers(app)
 
 if __name__ == "__main__":
-    print("🤖 Zilong Converter Bot starting…")
+    print("⚡ Zilong Converter Bot starting…")
     app.run()
