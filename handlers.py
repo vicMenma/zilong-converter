@@ -65,10 +65,22 @@ def register_handlers(app: Client):
     # ══════════════════════════════════════════════════════════════════════════
     #  /start  — show main menu
     # ══════════════════════════════════════════════════════════════════════════
+    # track the last menu message per user to avoid stacking
+    _menu_msg: dict[int, int] = {}   # uid → message_id
+
     @app.on_message(filters.command("start"))
     async def cmd_start(client: Client, msg: Message):
-        reset_session(msg.from_user.id)
-        await msg.reply_text(MSG_START, reply_markup=KB_MAIN)
+        uid = msg.from_user.id
+        reset_session(uid)
+        # delete old menu message if it exists
+        old_id = _menu_msg.get(uid)
+        if old_id:
+            try:
+                await client.delete_messages(msg.chat.id, old_id)
+            except Exception:
+                pass
+        sent = await msg.reply_text(MSG_START, reply_markup=KB_MAIN)
+        _menu_msg[uid] = sent.id
 
     # ══════════════════════════════════════════════════════════════════════════
     #  /cancel  — hard reset
@@ -153,10 +165,8 @@ def register_handlers(app: Client):
             await _run_compression(client, msg, uid)
             return
 
-        await msg.reply_text(
-            "❓ Send a video/subtitle file, paste a URL, or use the menu.",
-            reply_markup=KB_MAIN,
-        )
+        # Don't reply to random messages — avoids menu spam
+        return
 
 
     # ══════════════════════════════════════════════════════════════════════════
